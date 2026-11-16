@@ -37,6 +37,21 @@ def load_breaths(path):
     return df
 
 
+def add_inputs(df, args):
+    """Append optional per-breath input columns to df; return the input column list."""
+    inputs = list(INPUTS)
+    g = df.groupby("breath_id")["u_in"]
+    if args.u_in_cumsum:
+        df["u_in_cumsum"] = g.cumsum()
+        inputs.append("u_in_cumsum")
+    if args.u_in_lags:
+        df["u_in_lag1"] = g.shift(1).fillna(0)    # 1 step back (0 at first step)
+        df["u_in_lead1"] = g.shift(-1).fillna(0)  # 1 step forward (0 at last step)
+        df["u_in_diff1"] = df["u_in"] - df["u_in_lag1"]
+        inputs += ["u_in_lag1", "u_in_lead1", "u_in_diff1"]
+    return inputs
+
+
 def to_arrays(df, inputs):
     n = len(df) // SEQ_LEN
     X = df[inputs].to_numpy(np.float32).reshape(n, SEQ_LEN, len(inputs))
@@ -92,20 +107,23 @@ def main():
     ap.add_argument("--refit-all", action="store_true",
                     help="train on all of train.csv (no holdout), predict test.csv, write --out")
     ap.add_argument("--out", default="submission.csv")
+    ap.add_argument("--seed", type=int, default=SEED,
+                    help="model init / batch-order seed; the holdout split always uses seed 42")
+    ap.add_argument("--save-holdout-preds", default="",
+                    help="save holdout predictions (+ breath ids) to this .npz for ensembling")
+    ap.add_argument("--u-in-lags", action="store_true",
+                    help="add u_in lag 1, lead 1, and u_in - lag1 as inputs")
     ap.add_argument("--max-train-breaths", type=int, default=0, help="subsample for smoke tests")
     ap.add_argument("--device", default="mps" if torch.backends.mps.is_available() else "cpu")
     args = ap.parse_args()
 
     t_start = time.time()
-    torch.manual_seed(SEED)
-    np.random.seed(SEED)
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
     device = torch.device(args.device)
 
     df = load_breaths(f"{args.data_dir}/train.csv")
-    inputs = list(INPUTS)
-    if args.u_in_cumsum:
-        df["u_in_cumsum"] = df.groupby("breath_id")["u_in"].cumsum()
-        inputs.append("u_in_cumsum")
+    inputs = add_inputs(df, args)
     print(f"inputs: {inputs}")
     if args.refit_all:
         tr_df, va_df = df, None
@@ -166,8 +184,7 @@ def main():
 
     if args.refit_all:
         test = load_breaths(f"{args.data_dir}/test.csv")
-        if args.u_in_cumsum:
-            test["u_in_cumsum"] = test.groupby("breath_id")["u_in"].cumsum()
+        assert add_inputs(test, args) == inputs
         Xte, _, _ = to_arrays(test, inputs)
         Xte = (Xte - mu) / sd
         check_X, check_pred = Xte, predict(model, Xte, device)
@@ -184,6 +201,10 @@ def main():
         print(f"wrote {args.out}: {len(sub)} rows; all {raw_test_ids.nunique()} test ids present, no NaN/inf")
     else:
         check_X, check_pred = Xva, va_pred
+        if args.save_holdout_preds:
+            np.savez(args.save_holdout_preds, pred=va_pred, y=yva, mask=mva,
+                     breath_id=va_df["breath_id"].to_numpy()[::SEQ_LEN])
+            print(f"saved holdout predictions to {args.save_holdout_preds}")
 
     if device.type == "mps":
         # MPS sanity check: the same weights on CPU must give the same predictions
